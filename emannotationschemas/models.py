@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     MetaData,
     Table,
+    text,
 )
 from sqlalchemy.ext.declarative import DeclarativeMeta, declarative_base
 
@@ -21,6 +22,7 @@ from emannotationschemas.errors import (
     InvalidSchemaField,
     InvalidTableMetaDataException,
     UnknownAnnotationTypeException,
+    VersionColumnsRequireSegmentationException,
 )
 from emannotationschemas.flatten import create_flattened_schema
 from emannotationschemas.schemas.base import (
@@ -208,6 +210,7 @@ def create_sqlalchemy_model(
     segmentation_source: str = None,
     table_metadata: dict = None,
     with_crud_columns: bool = False,
+    with_version_columns: bool = False,
     reset_cache: bool = False,
 ) -> DeclarativeMeta:
     """Create a SQLAlchemy model from supplied
@@ -226,6 +229,11 @@ def create_sqlalchemy_model(
     with_crud_columns : bool, optional
         add additional created, deleted and superceded_id columns on
         an table model, by default False
+    with_version_columns : bool, optional
+        restructure the segmentation table's id/anno_id and add
+        valid_from_version/valid_to_version columns, for mapping onto a
+        consolidated (multi-version) segmentation table. Only valid when
+        segmentation_source is set, by default False
 
     Returns
     -------
@@ -239,6 +247,7 @@ def create_sqlalchemy_model(
         segmentation_source=segmentation_source,
         table_metadata=table_metadata,
         with_crud_columns=with_crud_columns,
+        with_version_columns=with_version_columns,
         reset_cache=reset_cache,
     )
     if reset_cache:
@@ -253,6 +262,7 @@ def create_table_dict(
     segmentation_source: str = None,
     table_metadata: dict = None,
     with_crud_columns: bool = False,
+    with_version_columns: bool = False,
     reset_cache: bool = False,
 ) -> dict:
     """Generate a dictionary of SQLAlchemy Columns that represent a table
@@ -268,6 +278,11 @@ def create_table_dict(
     with_crud_columns : bool, optional
         add additional created, deleted and superceded_id columns on
         an table model, by default False
+    with_version_columns : bool, optional
+        map the segmentation table's restructured id/anno_id columns and add
+        valid_from_version/valid_to_version, for a consolidated (multi-version)
+        segmentation table. Only valid when segmentation_source is set,
+        by default False
 
     Returns
     -------
@@ -277,30 +292,57 @@ def create_table_dict(
     Raises
     ------
     InvalidTableMetaDataException
+    VersionColumnsRequireSegmentationException
     """
+    if with_version_columns and not segmentation_source:
+        raise VersionColumnsRequireSegmentationException(
+            "with_version_columns=True requires a segmentation_source; the "
+            "anno_id/id restructuring only applies to segmentation tables."
+        )
+
     model_dict = {}
     if segmentation_source:
-        model_dict.update(
-            {
-                "__tablename__": create_segmentation_table_name(
-                    table_name, segmentation_source
-                ),
-                "id": Column(
-                    BigInteger,
-                    ForeignKey(
-                        f"{table_name}.id",
-                        ondelete="CASCADE",
+        seg_table_name = create_segmentation_table_name(table_name, segmentation_source)
+        if with_version_columns:
+            model_dict.update(
+                {
+                    "__tablename__": seg_table_name,
+                    "id": Column(BigInteger, primary_key=True, autoincrement=True),
+                    "anno_id": Column(
+                        BigInteger,
+                        ForeignKey(f"{table_name}.id", ondelete="CASCADE"),
+                        index=True,
                     ),
-                    primary_key=True,
-                ),
-                "__mapper_args__": {
-                    "polymorphic_identity": create_segmentation_table_name(
-                        table_name, segmentation_source
+                    "valid_from_version": Column(BigInteger, nullable=False),
+                    "valid_to_version": Column(
+                        BigInteger,
+                        nullable=False,
+                        server_default=text("current_mat_marker()"),
                     ),
-                    "concrete": True,
-                },
-            }
-        )
+                    "__mapper_args__": {
+                        "polymorphic_identity": seg_table_name,
+                        "concrete": True,
+                    },
+                }
+            )
+        else:
+            model_dict.update(
+                {
+                    "__tablename__": seg_table_name,
+                    "id": Column(
+                        BigInteger,
+                        ForeignKey(
+                            f"{table_name}.id",
+                            ondelete="CASCADE",
+                        ),
+                        primary_key=True,
+                    ),
+                    "__mapper_args__": {
+                        "polymorphic_identity": seg_table_name,
+                        "concrete": True,
+                    },
+                }
+            )
     else:
         model_dict.update(
             {
@@ -587,6 +629,7 @@ def make_model_from_schema(
     segmentation_source: str = None,
     table_metadata: dict = None,
     with_crud_columns: bool = True,
+    with_version_columns: bool = False,
     reset_cache: bool = False,
 ) -> DeclarativeMeta:
     """Create either the annotation or segmentation
@@ -614,6 +657,12 @@ def make_model_from_schema(
     with_crud_columns : bool, optional
         add additional created, deleted and superceded_id columns on
         an annotation table model, by default True
+    with_version_columns : bool, optional
+        map the segmentation model onto a consolidated (multi-version) table's
+        restructured id/anno_id columns plus valid_from_version/valid_to_version,
+        instead of the plain 1:1 id-is-the-FK segmentation table shape. Only
+        applies to the segmentation model; requires segmentation_source, by
+        default False
     reset_cache: bool, optional
         resets the sqlalchemy metadata and local cached model in case the target
         model changes, by default False
@@ -624,6 +673,12 @@ def make_model_from_schema(
         SQLAlchemy Model instance of either the annotation
         or segmentation columns of the schema
     """
+    if with_version_columns and not segmentation_source:
+        raise VersionColumnsRequireSegmentationException(
+            "with_version_columns=True requires a segmentation_source; the "
+            "anno_id/id restructuring only applies to segmentation tables."
+        )
+
     Schema = get_schema(schema_type)
     annotation_schema, segmentation_schema = split_annotation_schema(Schema)
     if reset_cache:
@@ -649,6 +704,7 @@ def make_model_from_schema(
                 segmentation_source=segmentation_source,
                 table_metadata=table_metadata,
                 with_crud_columns=False,
+                with_version_columns=with_version_columns,
                 reset_cache=reset_cache,
             )
         return sqlalchemy_models.get_model(seg_table_name)
